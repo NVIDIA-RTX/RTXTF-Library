@@ -76,20 +76,24 @@ struct STF_SamplerState
     STF_MUTATING void SetFrameIndex(uint frameIndex)             { m_impl.m_frameIndex = frameIndex; }             /* Frame index used to calculate odd / even frames for STF_MAGNIFICATION_METHOD_2x2_FINE_TEMPORAL)*/
     STF_MUTATING void SetAnisoMethod(uint anisoMethod)           { m_impl.m_anisoMethod = anisoMethod; }           /*STF_ANISO_LOD_METHOD_*/
     STF_MUTATING void SetMagMethod(uint magMethod)               { m_impl.m_magMethod = magMethod; }               /*STF_MAGNIFICATION_METHOD_*/
+    STF_MUTATING void SetFallbackMethod(uint fallbackMethod)     { m_impl.m_fallbackMethod = fallbackMethod; }     /*STF_MAGNIFICATION_FALLBACK_METHOD_*/
     STF_MUTATING void SetAddressingModes(uint3 addressingModes)  { m_impl.m_addressingModes = addressingModes; }   /*STF_ADDRESS_MODE_* - Only applied when using 'Load*/
     STF_MUTATING void SetSigma(float sigma)                      { m_impl.m_sigma = sigma; }
     STF_MUTATING void SetReseedOnSample(bool reseedOnSample)     { m_impl.m_reseedOnSample = reseedOnSample; }     /*Each sample will update the random numbers default: false*/
     STF_MUTATING void SetUserData(uint4 userData)                { m_impl.m_userData = userData; }
+    STF_MUTATING void SetDebugFailure(bool debugFailure)         { m_impl.m_debugFallback = debugFailure; }
 
     float4 GetUniformRandom()         { return m_impl.m_u; }
     uint   GetFilterType()            { return m_impl.m_filterType; }           /*STF_FILTER_TYPE_*/
     uint   GetFrameIndex()            { return m_impl.m_frameIndex; }
     uint   GetAnisoMethod()           { return m_impl.m_anisoMethod; }          /*STF_ANISO_LOD_METHOD_*/
     uint   GetMagMethod()             { return m_impl.m_magMethod; }            /*STF_MAGNIFICATION_METHOD_*/
+    uint   GetFallbackMethod()        { return m_impl.m_fallbackMethod; }       /*STF_MAGNIFICATION_FALLBACK_METHOD_*/
     uint3  GetAddressingModes()       { return m_impl.m_addressingModes; }      /*STF_ADDRESS_MODE_* - Only applied when using 'Load'*/ 
     float  GetSigma()                 { return m_impl.m_sigma; }
     bool   GetReseedOnSample()        { return m_impl.m_reseedOnSample; }       /*Each sample will update the random numbers*/
     uint4  GetUserData()              { return m_impl.m_userData; }
+    bool   GetDebugFailure()          { return m_impl.m_debugFallback; }
 
     // Texture2D with Texture and SamplerState objects, will use 'tex.Sample' internally
     STF_MUTATING float4 Texture2DSample(Texture2D tex, SamplerState s, float2 uv) { return m_impl._Texture2DSample(tex, s, uv); }

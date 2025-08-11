@@ -32,6 +32,16 @@
 #define STF_MAGNIFICATION_METHOD_3x3_FINE_ALU                4
 #define STF_MAGNIFICATION_METHOD_3x3_FINE_LUT                5
 #define STF_MAGNIFICATION_METHOD_4x4_FINE                    6
+#define STF_MAGNIFICATION_METHOD_MIN_MAX                     7
+#define STF_MAGNIFICATION_METHOD_MIN_MAX_HELPER              8
+#define STF_MAGNIFICATION_METHOD_MIN_MAX_V2                  9
+#define STF_MAGNIFICATION_METHOD_MIN_MAX_V2_HELPER           10
+#define STF_MAGNIFICATION_METHOD_MASK                        11
+#define STF_MAGNIFICATION_METHOD_MASK2                       12
+
+// When magnification fails we (sometimes) need a matching fallback strategy
+#define STF_MAGNIFICATION_FALLBACK_METHOD_BL1STFILTER_FAST   0
+#define STF_MAGNIFICATION_FALLBACK_METHOD_DEBUG              1
 
 #define STF_WAVE_READ_SAMPLES_PER_PIXEL     8
 
@@ -57,5 +67,7 @@
 #define STF_SHADER_STAGE_AMPLIFICATION      7
 #define STF_SHADER_STAGE_MESH               8
 #define STF_SHADER_STAGE_LIBRARY            9
+
+#define STF_FLT_MAX          3.402823466e+38F
 
 #endif // #ifndef __STF_DEFINITIONS_H__

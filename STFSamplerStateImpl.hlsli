@@ -358,6 +358,14 @@ struct STF_SamplerStateImpl
     {
         return m_magMethod;
     } 
+    uint _GetFallbackMethod()
+    {
+        return m_fallbackMethod;
+    } 
+    bool _GetDebugFallback()
+    {
+        return m_debugFallback == 1;
+    } 
     uint3 _GetAddressingModes()
     {
         return m_addressingModes;
@@ -609,15 +617,35 @@ float _GetQuadShareWeight(float2 texelCoord, int2 coordOther, float otherPDF)
 
     return _GetFilterPDF(texelCoord, coordOther)/otherPDF;
 }
+
+bool _GetIsHelperLane()
+{
+#if STF_SHADER_MODEL_MAJOR >= 6 && STF_SHADER_MODEL_MINOR >= 6 && (STF_SHADER_STAGE == STF_SHADER_STAGE_PIXEL)
+    return IsHelperLane();
+#else
+    return false;
+#endif
+}
     
 #if STF_ALLOW_WAVE_READ
 uint4 GetActiveThreadMask()
 {
 #if STF_SHADER_MODEL_MAJOR >= 6 && STF_SHADER_MODEL_MINOR >= 6 && (STF_SHADER_STAGE == STF_SHADER_STAGE_PIXEL)
     // WaveReadLaneAt is undefined when reading from helper lanes.
-    const uint4 activeThreads = WaveActiveBallot( !IsHelperLane() );
+    const uint4 activeThreads = WaveActiveBallot( !_GetIsHelperLane() );
 #else
     const uint4 activeThreads = WaveActiveBallot(true);
+#endif
+    return activeThreads;
+}
+
+uint4 GetActiveThreadMask(bool isAvailable)
+{
+#if STF_SHADER_MODEL_MAJOR >= 6 && STF_SHADER_MODEL_MINOR >= 6 && (STF_SHADER_STAGE == STF_SHADER_STAGE_PIXEL)
+    // WaveReadLaneAt is undefined when reading from helper lanes.
+    const uint4 activeThreads = WaveActiveBallot( isAvailable && !_GetIsHelperLane() );
+#else
+    const uint4 activeThreads = WaveActiveBallot(isAvailable);
 #endif
     return activeThreads;
 }
@@ -886,6 +914,862 @@ float4 _Texture2DSampleImpl(
     return _Texture2DMagImpl(val, uv, samplePos.xy, width, height);
 }
 
+float4 _GetCividis(int index, int min, int max)
+{
+    const float t = (float)index / (max - min);
+
+    const float t2 = t * t;
+    const float t3 = t2 * t;
+    
+    float4 color;
+    color.r = 0.8688 * t3 - 1.5484 * t2 + 0.0081 * t + 0.2536;
+    color.g = 0.8353 * t3 - 1.6375 * t2 + 0.2351 * t + 0.8669;
+    color.b = 0.6812 * t3 - 1.0197 * t2 + 0.3935 * t + 0.8815;
+    color.a = 0.f;
+    
+    return color;
+}
+
+bool _LanesLowerThanCountActive(uint count)
+{
+    uint activeLanesBitMask = WaveActiveBallot(true).x;
+    // This is overly conservative and an optimization. Instead of doing this, we could use prefix sums and map
+    // lane index to active lane index and then loop over using WaveReadLaneAt().
+    // Let's see on "real" geometry if partial waves with inactive early lanes are a problem.
+    uint desiredActiveMask = (1u << count) - 1u;
+
+    // I think the above expression could overflow, so I added "allActive", to verify.
+    bool allActive = activeLanesBitMask == 0xFFFFFFFF;
+    return allActive || (activeLanesBitMask & desiredActiveMask) == desiredActiveMask;
+}
+
+void _ComputeSTCoords(uint width, uint height, float2 uv, out int2 integerCoords, out float2 stCoords, out float2 floatCoords)
+{
+    floatCoords = uv * uint2(width, height) - float2(0.5f, 0.5f);
+    integerCoords = int2(floor(floatCoords));
+    stCoords = floatCoords - integerCoords;
+}
+
+void _ClampIntCoords(uint width, uint height, inout int2 upperLeftIntCoords, inout int2 lowerRightIntCoords)
+{
+    upperLeftIntCoords = clamp(upperLeftIntCoords, int2(0, 0), int2(width, height) - int2(1, 1));
+    lowerRightIntCoords = clamp(lowerRightIntCoords, int2(0, 0), int2(width, height) - int2(1, 1));
+}
+
+void _ClampIntCoords(uint width, uint height, inout int2 intCoords)
+{
+    intCoords = clamp(intCoords, int2(0, 0), int2(width, height) - int2(1, 1));
+}
+
+float4 _BilinearWeights(float2 uv)
+{
+    const float oneMinusU = 1.0f - uv.x;
+    const float oneMinusV = 1.0f - uv.y;
+    return float4(oneMinusU * oneMinusV, uv.x * oneMinusV, oneMinusU * uv.y, uv.x * uv.y);
+}
+
+int2 _LaneIdxToCoord(uint laneIdx, int2 waveUpperLeftIntCoords, uint bbWidth)
+{
+    uint laneY = laneIdx / bbWidth;
+    uint laneX = laneIdx % bbWidth;
+    return waveUpperLeftIntCoords + int2(laneX, laneY);
+}
+
+uint _CoordToLaneIdx(int2 coord, int2 waveUpperLeftIntCoords, uint bbWidth)
+{
+    coord -= waveUpperLeftIntCoords;
+    return coord.x + coord.y * bbWidth;
+}
+
+int _SampleDiscrete4(float4 weights, inout float rnd)
+{
+    float sumWeights = weights.x + weights.y + weights.z + weights.w;
+    float up = rnd * sumWeights;
+    //    if (up == sumWeights)         // From PBRT. TODO. For now, I think that that <3 in the while loop below "solves" (avoids) the problem.
+    //        up = NextFloatDown(up);
+
+    // Find offset in weights corresponding to up, i.e., rnd.
+    int offset = 0;
+    float sum = 0;
+    while (sum + weights[offset] <= up && offset < 3)
+    {
+        sum += weights[offset++];
+    }
+    const float OneMinusEpsilon = 1.0f - 1.0e-7f;
+    rnd = min((up - sum) / weights[offset], OneMinusEpsilon);
+    return offset;
+}
+
+float4 _CubicBSplineWeights(float t)
+{
+    float4 weights;
+    const float oneSixth = 1.0f / 6.0f;
+    const float t2 = t * t;
+    const float t3 = t2 * t;
+    weights.x = -t3 + 3.0f * (t2 - t) + 1.0f;   // TODO: check if these factorizations actually are faster.
+    weights.y = 3.0f * t2 * (t - 2.0f) + 4.0f;
+    weights.z = 3.0f * (-t3 + t2 + t) + 1.0f;
+    weights.w = t3;
+    return weights * oneSixth;
+}
+
+float4 _BBS1STFilter(Texture2D texture, uint width, uint height, float2 uv, out int2 upperLeftCoords, out int2 iCoords, out float2 stCoords, out float2 fCoords, in out float2 rnd01)
+{
+    _ComputeSTCoords(width, height, uv, iCoords, stCoords, fCoords);
+
+    float4 sWeights = _CubicBSplineWeights(stCoords.x);
+    float4 tWeights = _CubicBSplineWeights(stCoords.y);
+    iCoords -= int2(1, 1);
+    upperLeftCoords = iCoords;
+
+    int s = _SampleDiscrete4(sWeights, rnd01.x);
+    int t = _SampleDiscrete4(tWeights, rnd01.y);
+    iCoords += int2(s, t);
+    int2 coordsToSample = iCoords;
+    _ClampIntCoords(width, height, coordsToSample);
+    return texture[int2(coordsToSample.x, coordsToSample.y)];
+}
+float4 _BBSWaveGatherFilter(Texture2D texture, uint width, uint height, float2 uv, float2 rnd01)
+{
+    int kINT32_MIN = -2147483648;
+
+    int2 upperLeftIntCoords, sampledTexelIntCoords = int2(kINT32_MIN, kINT32_MIN);
+    float2 stCoords, texelFloatCoords;
+    float4 curPixelTexelValue = //_IsCatRom() ? _BCR1STSelectSingleSample(texture, uv, upperLeftIntCoords, sampledTexelIntCoords, stCoords, texelFloatCoords, rnd01) : 
+                                              _BBS1STFilter(texture, width, height, uv, upperLeftIntCoords, sampledTexelIntCoords, stCoords, texelFloatCoords, rnd01);
+
+    uint numActiveMaxWeigthLanes = 0;
+    float4 bbsWeightsX = /*_IsCatRom() ? _cubicCatmullRomWeights(stCoords.x) : */_CubicBSplineWeights(stCoords.x);
+    float4 bbsWeightsY = /*_IsCatRom() ? _cubicCatmullRomWeights(stCoords.y) : */_CubicBSplineWeights(stCoords.y);
+
+    uint gotTexelMask = 0; // bit0 = (0,0), bit1 = (1,0), bit2 = (0,1), bit3 = (1,1).
+    float4 filteredColor = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 accumSamples = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float sumWeight = 0.0f;
+    int cc = 0;
+    for (int laneIdx = 0; laneIdx < 32; laneIdx++)
+    {
+        int2 deltaIntCoords = WaveReadLaneAt(sampledTexelIntCoords, laneIdx) - upperLeftIntCoords;
+        uint bitNo = (deltaIntCoords.y << 2) + deltaIntCoords.x;
+        uint mask = 1u << bitNo;
+        float4 texelValue = WaveReadLaneAt(curPixelTexelValue, laneIdx);
+        if ((gotTexelMask & mask) == 0)  // Faster with this if case before the next one.
+        {
+            if ((uint)(deltaIntCoords.x | deltaIntCoords.y) < 4)
+            {
+                gotTexelMask |= mask;               // Set bit to indicate that we already have this texel weighted in.
+                float weight = bbsWeightsX[deltaIntCoords.x] * bbsWeightsY[deltaIntCoords.y];
+                sumWeight += weight;
+                filteredColor += texelValue * weight;
+                accumSamples += texelValue;
+                cc++;
+            }
+        }
+    }
+
+    int numGatheredTexels = countbits(gotTexelMask);
+    // print("cc = ", cc);
+    // print("numGatheredTexels =", numGatheredTexels);
+
+    // Very seldom we get sumWeight == 0.0f, and then we just use the STF texel.
+    if (sumWeight == 0.0f)
+        return curPixelTexelValue;
+
+    // Unbiased estimate of the missing sample(s) - average of the existing ones.
+    float4 estimatedMissingSamples = accumSamples / numGatheredTexels;
+    filteredColor += estimatedMissingSamples * (1.0f - sumWeight);
+    filteredColor.w = numActiveMaxWeigthLanes / 32.0;
+    return filteredColor;
+}
+
+float4 _Tex2DWaveMinMaxImpl(Texture2D tex, float2 uv, uint width, uint height, float2 rnd01, uint fallbackMethod, bool helperAware, bool debugFallback)
+{
+#if STF_ALLOW_WAVE_READ
+    int2 upperLeftIntCoords;
+    float2 floatTexCoords;
+    float2 stCoords;
+    _ComputeSTCoords(width, height, uv, upperLeftIntCoords, stCoords, floatTexCoords);
+    int2 lowerRightIntCoords = upperLeftIntCoords + int2(1, 1);
+    _ClampIntCoords(width, height, upperLeftIntCoords, lowerRightIntCoords);
+
+    int kMAX_INT = 2147483647;
+    int kMIN_INT = -2147483647;
+
+    upperLeftIntCoords = helperAware && _GetIsHelperLane() ? kMAX_INT.xx : upperLeftIntCoords;
+    lowerRightIntCoords = helperAware && _GetIsHelperLane() ? kMIN_INT.xx : lowerRightIntCoords;
+    
+    int2 waveUpperLeftIntCoords = WaveActiveMin(upperLeftIntCoords);
+    int2 waveLowerRightIntCoords = WaveActiveMax(lowerRightIntCoords);
+
+    uint bbWidth = uint(waveLowerRightIntCoords.x - waveUpperLeftIntCoords.x) + 1;
+    uint bbHeight = uint(waveLowerRightIntCoords.y - waveUpperLeftIntCoords.y) + 1;
+    uint activeTexels = bbWidth * bbHeight;
+
+    bool requiredLanesActive = _LanesLowerThanCountActive(activeTexels);
+
+    if (activeTexels > 32 || !requiredLanesActive)
+    {
+        if (debugFallback)
+            return float4(1,1,1,1);
+        return _EvaluateFallbackMethod(fallbackMethod, tex, width, height, uv, rnd01, upperLeftIntCoords, stCoords, floatTexCoords);
+       // float4 color = _BBSWaveGatherFilter(tex, width, height, uv, rnd01);
+       // return float4(color.xyz, 1);
+    }
+
+    uint curLaneIdx = WaveGetLaneIndex();
+    float4 texelValue = float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    if (curLaneIdx <= activeTexels)
+    {
+        texelValue = tex[_LaneIdxToCoord(curLaneIdx, waveUpperLeftIntCoords, bbWidth)];
+    }
+
+    float4 bilinWeights = _BilinearWeights(stCoords);
+    float4 filteredColor = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    filteredColor += WaveReadLaneAt(texelValue, _CoordToLaneIdx(int2(upperLeftIntCoords.x, upperLeftIntCoords.y), waveUpperLeftIntCoords, bbWidth)) * bilinWeights.x;
+    filteredColor += WaveReadLaneAt(texelValue, _CoordToLaneIdx(int2(lowerRightIntCoords.x, upperLeftIntCoords.y), waveUpperLeftIntCoords, bbWidth)) * bilinWeights.y;
+    filteredColor += WaveReadLaneAt(texelValue, _CoordToLaneIdx(int2(upperLeftIntCoords.x, lowerRightIntCoords.y), waveUpperLeftIntCoords, bbWidth)) * bilinWeights.z;
+    filteredColor += WaveReadLaneAt(texelValue, _CoordToLaneIdx(int2(lowerRightIntCoords.x, lowerRightIntCoords.y), waveUpperLeftIntCoords, bbWidth)) * bilinWeights.w;
+    filteredColor.w = activeTexels / 32.0;  // Average number of texel lookups per pixel in this wave. Used for statistics. 
+    return filteredColor;
+#else
+    return 0.f;
+#endif
+}
+
+// V2 has better handling of failure-cases
+float4 _Tex2DWaveMinMaxV2Impl(Texture2D tex, float2 uv, uint width, uint height, float2 rnd01, uint fallbackMethod, bool helperAware, bool debugFallback)
+{
+#if STF_ALLOW_WAVE_READ
+    int2 upperLeftIntCoords;
+    float2 floatTexCoords;
+    float2 stCoords;
+    _ComputeSTCoords(width, height, uv, upperLeftIntCoords, stCoords, floatTexCoords);
+    int2 lowerRightIntCoords = upperLeftIntCoords + int2(1, 1);
+    _ClampIntCoords(width, height, upperLeftIntCoords, lowerRightIntCoords);
+    
+    int kMAX_INT = 2147483647;
+    int kMIN_INT = -2147483647;
+
+    upperLeftIntCoords = helperAware && _GetIsHelperLane() ? kMAX_INT.xx : upperLeftIntCoords;
+    lowerRightIntCoords = helperAware && _GetIsHelperLane() ? kMIN_INT.xx : lowerRightIntCoords;
+    
+    int2 waveUpperLeftIntCoords = WaveActiveMin(upperLeftIntCoords);
+    int2 waveLowerRightIntCoords = WaveActiveMax(lowerRightIntCoords);
+    uint bbWidth = uint(waveLowerRightIntCoords.x - waveUpperLeftIntCoords.x) + 1;
+    uint bbHeight = uint(waveLowerRightIntCoords.y - waveUpperLeftIntCoords.y) + 1;
+    uint activeTexels = bbWidth * bbHeight;
+
+    bool requiredLanesActive = _LanesLowerThanCountActive(activeTexels);
+
+//#if PRINT_NUM_TEXELS_REQUIRED
+//    float numTexelsRequired = float(activeTexels) / 32.0;
+//#else
+    float numTexelsRequired = 1.0;
+//#endif
+
+    uint activeLanesBitMask = WaveActiveBallot(true).x;
+    if(activeTexels > countbits(activeLanesBitMask))
+    {
+        if (debugFallback)
+            return float4(1, 1, 1, 1);
+        return _EvaluateFallbackMethod(fallbackMethod, tex, width, height, uv, rnd01, upperLeftIntCoords, stCoords, floatTexCoords);
+    }
+
+    uint curLaneIdx = WaveGetLaneIndex();
+    float4 texelValue = 0.0f.xxxx;
+
+    float4 bilinWeights = _bilinearWeights(stCoords);
+    float4 filteredColor = 0.0f.xxxx;
+
+    if (_LanesLowerThanCountActive(activeTexels)) // Handle the simple case.
+    {
+        if (curLaneIdx <= activeTexels)
+        {
+            texelValue = tex[_LaneIdxToCoord(curLaneIdx, waveUpperLeftIntCoords, bbWidth)];
+        }
+
+        filteredColor += WaveReadLaneAt(texelValue, _CoordToLaneIdx(int2(upperLeftIntCoords.x, upperLeftIntCoords.y), waveUpperLeftIntCoords, bbWidth)) * bilinWeights.x;
+        filteredColor += WaveReadLaneAt(texelValue, _CoordToLaneIdx(int2(lowerRightIntCoords.x, upperLeftIntCoords.y), waveUpperLeftIntCoords, bbWidth)) * bilinWeights.y;
+        filteredColor += WaveReadLaneAt(texelValue, _CoordToLaneIdx(int2(upperLeftIntCoords.x, lowerRightIntCoords.y), waveUpperLeftIntCoords, bbWidth)) * bilinWeights.z;
+        filteredColor += WaveReadLaneAt(texelValue, _CoordToLaneIdx(int2(lowerRightIntCoords.x, lowerRightIntCoords.y), waveUpperLeftIntCoords, bbWidth)) * bilinWeights.w;
+    }
+    else
+    {
+        if (debugFallback)
+            return float4(0, 1, 0, 0);
+
+        uint lastLaneNeededIdx = __fns3(activeLanesBitMask, activeTexels - 1);
+        if (curLaneIdx <= lastLaneNeededIdx) // This lane needs to do a texture lookup.
+        {
+            uint remappedLaneIdx = transformLaneNoToActiveLaneNo(curLaneIdx, activeLanesBitMask);
+            texelValue = tex[_LaneIdxToCoord(remappedLaneIdx, waveUpperLeftIntCoords, bbWidth)];
+        }
+
+        uint4 indices = uint4(
+            _CoordToLaneIdx(int2(upperLeftIntCoords.x, upperLeftIntCoords.y), waveUpperLeftIntCoords, bbWidth),
+            _CoordToLaneIdx(int2(lowerRightIntCoords.x, upperLeftIntCoords.y), waveUpperLeftIntCoords, bbWidth),
+            _CoordToLaneIdx(int2(upperLeftIntCoords.x, lowerRightIntCoords.y), waveUpperLeftIntCoords, bbWidth),
+            _CoordToLaneIdx(int2(lowerRightIntCoords.x, lowerRightIntCoords.y), waveUpperLeftIntCoords, bbWidth));
+
+        uint4 remappedLaneIndices = uint4(__fns3(activeLanesBitMask, indices.x),
+                                          __fns3(activeLanesBitMask, indices.y),
+                                          __fns3(activeLanesBitMask, indices.z),
+                                          __fns3(activeLanesBitMask, indices.w));
+
+        filteredColor += WaveReadLaneAt(texelValue, remappedLaneIndices.x) * bilinWeights.x;
+        filteredColor += WaveReadLaneAt(texelValue, remappedLaneIndices.y) * bilinWeights.y;
+        filteredColor += WaveReadLaneAt(texelValue, remappedLaneIndices.z) * bilinWeights.z;
+        filteredColor += WaveReadLaneAt(texelValue, remappedLaneIndices.w) * bilinWeights.w;
+    }
+    filteredColor.w = activeTexels / 32.0;  // Average number of texel lookups per pixel in this wave. Used for statistics. 
+    return filteredColor;
+
+#else
+    return 0.f;
+#endif
+}
+
+// countbits() does not currently work for 64 bit uints, so doing this instead.
+uint _countbits(uint64_t m)
+{
+    return countbits(uint(m)) + countbits(uint(m >> 32));
+}
+
+float4 _bilinearWeights(float2 uv)
+{
+//    uv.x = uv.x * uv.x * (3.0f - 2.0f * uv.x); // Add these two back in for a smoother interpolation.
+//    uv.y = uv.y * uv.y * (3.0f - 2.0f * uv.y);
+
+    const float oneMinusU = 1.0f - uv.x;
+    const float oneMinusV = 1.0f - uv.y;
+    return float4(oneMinusU * oneMinusV, uv.x * oneMinusV, oneMinusU * uv.y, uv.x * uv.y);
+}
+
+uint getNthBit2(uint64_t value, uint N)
+{
+    uint sumTOT0 = countbits(uint(value & 0xFFFFFFFF));
+
+    uint val;
+    uint count;
+    uint offset;
+#if 1
+    if(N < sumTOT0)  // Nth bit is in the bits [0,31]
+    {
+        uint4 maskedValues0 = uint4(uint(value & 0xFF),
+                                    uint((value >> 8) & 0xFF),
+                                    uint((value >> 16) & 0xFF),
+                                    uint((value >> 24) & 0xFF));
+        uint4 counts0 = uint4(countbits(maskedValues0.x),
+                              countbits(maskedValues0.y),
+                              countbits(maskedValues0.z),
+                              countbits(maskedValues0.w));
+        uint sumXY0 = counts0.x + counts0.y;
+        if (N < sumXY0) // Nth bit is in the bits [0,15]
+        {
+            if (N < counts0.x) // Nth bit is in the bits [0,7]
+            {
+                val = maskedValues0.x;
+                count = 0;
+                offset = 0;
+            }
+            else // Nth bit is in the bits [8,15]
+            {
+                val = maskedValues0.y;
+                count = counts0.x;
+                offset = 8;
+            }
+        }
+        else //  Nth bit is in the bits [16,31]
+        {
+            if (N < sumXY0 + counts0.z) // Nth bit is in the bits [16,23]
+            {
+                val = maskedValues0.z;
+                count = sumXY0;
+                offset = 16;
+            }
+            else // Nth bit is in the bits [24,31]
+            {
+                val = maskedValues0.w;
+                count = sumXY0 + counts0.z;
+                offset = 24;
+            }
+        }
+    }
+    else // Nth bit is in the bits [32,63]
+    {
+        uint4 maskedValues1 = uint4(uint((value >> 32) & 0xFF),
+                                    uint((value >> 40) & 0xFF),
+                                    uint((value >> 48) & 0xFF),
+                                    uint((value >> 56) & 0xFF));
+        uint4 counts1 = uint4(countbits(maskedValues1.x),
+                              countbits(maskedValues1.y),
+                              countbits(maskedValues1.z),
+                              countbits(maskedValues1.w));
+        uint sumXY1 = counts1.x + counts1.y;
+        if (N < sumTOT0 + sumXY1) //  Nth bit is in the bits [32,47]
+        {
+            if (N < sumTOT0 + counts1.x) //  Nth bit is in the bits [32,39]
+            {
+                val = maskedValues1.x;
+                count = sumTOT0;
+                offset = 32;
+            }
+            else //  Nth bit is in the bits [40,47]
+            {
+                val = maskedValues1.y;
+                count = sumTOT0 + counts1.x;
+                offset = 40;
+            }
+        }
+        else //  Nth bit is in the bits [48,63]
+        {
+            if (N < sumTOT0 + sumXY1 + counts1.z) //  Nth bit is in the bits [48,55]
+            {
+                val = maskedValues1.z;
+                count = sumTOT0 + sumXY1;
+                offset = 48;
+            }
+            else //  Nth bit is in the bits [56,63]
+            {
+                val = maskedValues1.w;
+                count = sumTOT0 + sumXY1 + counts1.z;
+                offset = 56;
+            }
+        }
+    }
+#else
+    uint4 maskedValues0 = uint4(uint(value & 0xFF),
+                                    uint((value >> 8) & 0xFF),
+                                    uint((value >> 16) & 0xFF),
+                                    uint((value >> 24) & 0xFF));
+    uint4 counts0 = uint4(countbits(maskedValues0.x),
+                              countbits(maskedValues0.y),
+                              countbits(maskedValues0.z),
+                          countbits(maskedValues0.w));
+    uint sumXY0 = counts0.x + counts0.y;
+    uint4 maskedValues1 = uint4(uint((value >> 32) & 0xFF),
+                                    uint((value >> 40) & 0xFF),
+                                    uint((value >> 48) & 0xFF),
+                                uint((value >> 56) & 0xFF));
+    uint4 counts1 = uint4(countbits(maskedValues1.x),
+                              countbits(maskedValues1.y),
+                              countbits(maskedValues1.z),
+                          countbits(maskedValues1.w));
+    uint sumXY1 = counts1.x + counts1.y;
+
+    if (N < counts0.x)
+    {
+        val = maskedValues0.x;
+        count = 0;
+        offset = 0;
+    }
+    else if (N < sumXY0)
+    {
+        val = maskedValues0.y;
+        count = counts0.x;
+        offset = 8;
+    }
+    else if (N < sumXY0 + counts0.z)
+    {
+        val = maskedValues0.z;
+        count = sumXY0;
+        offset = 16;
+    }
+    else if (N < sumTOT0)
+    {
+        val = maskedValues0.w;
+        count = counts0.x + counts0.y + counts0.z;
+        offset = 24;
+    }
+    else if (N < sumTOT0 + counts1.x)
+    {
+        val = maskedValues1.x;
+        count = sumTOT0;
+        offset = 32;
+    }
+    else if (N < sumTOT0 + sumXY1)
+    {
+        val = maskedValues1.y;
+        count = sumTOT0 + counts1.x;
+        offset = 40;
+    }
+    else if (N < sumTOT0 + sumXY1 + counts1.z)
+    {
+        val = maskedValues1.z;
+        count = sumTOT0 + sumXY1;
+        offset = 48;
+    }
+    else
+    {
+        val = maskedValues1.w;
+        count = sumTOT0 + sumXY1 + counts1.z;
+        offset = 56;
+    }
+#endif
+#if 1
+    uint foundValue = 0;
+    [unroll]
+    for (int q = 0; q < 8; q++)
+    {
+        if (q + count == N)
+        {
+            foundValue = val;
+        }
+        val &= (val - 1); // Zero out the least significant bit that is also 1.
+    }
+    return foundValue == 0 ? 0xFFFFFFFF : firstbitlow(foundValue) + offset;
+#else
+    while (val != 0)
+    {
+        uint idx = firstbitlow(val);
+        if (count == N)
+        {
+            print("answer = ", offset + idx);
+            return offset + idx;
+        }
+        val = val ^ (1u << idx);
+        count++;
+    }
+    return 0xFFFFFFFF; // Should never happen.
+#endif
+}
+
+
+uint2 getDeltaTexCoords(uint laneIdx, uint64_t4 waveMask, uint4 counts, uint2 sumCounts)
+{
+    uint idx;
+    // Do simple binary search on counts.
+    if (laneIdx < sumCounts.x) // The answer is in waveMask.xy.
+    {
+        if (laneIdx < counts.x) // The answer is in waveMask.x.
+        {
+            // We are looking for a bit=1 whose number is laneIdx in waveMask.x.
+            idx = getNthBit2(waveMask.x, laneIdx);
+        }
+        else // The answer is in waveMask.y.
+        {
+            idx = getNthBit2(waveMask.y, laneIdx - counts.x) + 64;
+        }
+    }
+    else // The answer is in waveMask.zw.
+    {
+        if (laneIdx < sumCounts.x + counts.z) // The answer is in waveMask.z.
+        {
+            idx = getNthBit2(waveMask.z, laneIdx - sumCounts.x) + 128;
+        }
+        else // The answer is in waveMask.w.
+        {
+            idx = getNthBit2(waveMask.w, laneIdx - sumCounts.x - counts.z) + 192;
+        }
+    }
+    return uint2(idx & 15, idx >> 4);
+}
+
+// uint getLaneIdxFromBitMaskNo(uint bitNo, uint64_t4 waveMask, uint4 counts, uint2 sumCounts)
+uint getLaneIdxFromBitMaskNo(uint bitNo, uint64_t4 waveMask, uint16_t4 counts, uint16_t2 sumCounts)
+{
+    uint idx = bitNo >> 6; // Index into waveMask.
+#if 0
+    // This was slower on 3090 and 4090!
+    uint4 accCounts = uint4(0, counts.x, sumCounts.x, sumCounts.x + counts.z);
+    return _countbits((uint64_t(0xFFFFFFFFFFFFFFFF) >> (64 - (bitNo-64*idx) - 1)) & waveMask[idx]) + accCounts[idx] - 1;
+#else
+    if (idx == 0)
+    {
+        return _countbits((uint64_t(0xFFFFFFFFFFFFFFFF) >> (64 - bitNo - 1)) & waveMask.x) - 1;
+    }
+    else if (idx == 1)
+    {
+        return _countbits((uint64_t(0xFFFFFFFFFFFFFFFF) >> (64 - (bitNo - 64) - 1)) & waveMask.y) + counts.x - 1;
+    }
+    else if (idx == 2)
+    {
+        return _countbits((uint64_t(0xFFFFFFFFFFFFFFFF) >> (64 - (bitNo - 128) - 1)) & waveMask.z) + sumCounts.x - 1;
+    }
+    else // idx == 3
+    {
+        return _countbits((uint64_t(0xFFFFFFFFFFFFFFFF) >> (64 - (bitNo - 192) - 1)) & waveMask.w) + sumCounts.x + counts.z - 1;
+    }
+    return 0;
+#endif
+}
+
+uint __fns3(uint value, uint N)
+{
+    uint count = countbits(value & 0xFFFF);
+#if 1
+    uint offset = 0;
+    if (N < count)
+    {
+        count = 0;
+    }
+    else
+    {
+        offset = 16;
+        value >>= 16;
+    }
+
+#if 0
+    while (value != 0)
+    {
+        uint idx = firstbitlow(value);
+        if (count == N)
+            return idx + offset;
+        value = value ^ (1u << idx);
+        count++;
+    }
+    return 0xFFFFFFFF; // Should never happen.
+#else
+    uint foundValue = 0;
+    [unroll]
+    for (int q = 0; q < 16; q++)
+    {
+        if (q + count == N)
+        {
+            foundValue = value;
+        }
+        value &= (value - 1); // Zero out the least significant bit that is also 1.
+    }
+    return foundValue == 0 ? 0xFFFFFFFF : firstbitlow(foundValue) + offset;
+
+#endif
+#else
+    if (N < count)
+    {
+        count = 0;
+        while (value != 0)
+        {
+            uint idx = firstbitlow(value);
+            if (count == N)
+                return idx;
+            value = value ^ (1u << idx);
+            count++;
+        }
+        return 0xFFFFFFFF; // Should never happen.
+    }
+    else
+    {
+        value >>= 16;
+        while (value != 0)
+        {
+            uint idx = firstbitlow(value);
+            if (count == N)
+                return idx + 16;
+            value = value ^ (1u << idx);
+            count++;
+        }
+        return 0xFFFFFFFF; // Should never happen.
+    }
+#endif
+}
+
+uint transformLaneNoToActiveLaneNo(uint curLaneIdx, uint activeLanesBitMask)
+{
+    return countbits((0xFFFFFFFFu >> (32u - curLaneIdx - 1u)) & activeLanesBitMask) - 1u;
+}
+
+float4 _BL1STFilterFast(Texture2D texture, uint width, uint height, float2 uv, in /*out*/ float2 rnd01, out int2 upperLeftIntCoords, out int2 iCoords, out float2 stCoords, out float2 fCoords)
+{
+    _ComputeSTCoords(width, height, uv, iCoords, stCoords, fCoords);
+    upperLeftIntCoords = iCoords;
+
+    float4 weights = _bilinearWeights(stCoords); // These weights come in the order: [0,0], [1,0], [0,1], [1,1], which
+    if (rnd01.x >= weights.x)
+    {
+        if (rnd01.x < weights.x + weights.y)
+        {
+            iCoords.x++;
+        }
+        else if (rnd01.x < 1.0 - weights.w)
+        {
+            iCoords.y++;
+        }
+        else
+        {
+            iCoords.x++;
+            iCoords.y++;
+        }
+    }
+    int2 iCoordsClamped = iCoords;
+    _ClampIntCoords(width, height, iCoordsClamped);
+    return texture[iCoordsClamped];
+}
+
+
+float4 _EvaluateFallbackMethod(uint method, Texture2D texture, uint width, uint height, float2 uv, float2 rnd01, uint2 upperLeftIntCoords, float2 stCoords, float2 floatTexCoords)
+{
+    float4 color = float4(1,0,1,0);
+    if (method == STF_MAGNIFICATION_FALLBACK_METHOD_BL1STFILTER_FAST)
+    {
+        int2 iCoords;
+        color = _BL1STFilterFast(texture, width, height, uv, rnd01, upperLeftIntCoords, iCoords, stCoords, floatTexCoords);
+    }
+    return float4(color.xyz, 1);
+}
+
+// _BL1WaveGlobalMaskFilter
+float4 _Tex2DWaveGlobalMaskImpl(Texture2D tex, float2 uv, uint width, uint height, float2 rnd01, uint fallbackMethod, bool excludeHelper, bool debugFallback)
+{
+#if STF_ALLOW_WAVE_READ
+    int2 upperLeftIntCoords;
+    float2 floatTexCoords;
+    float2 stCoords;
+    _ComputeSTCoords(width, height, uv, upperLeftIntCoords, stCoords, floatTexCoords);
+    uint activeLanesBitMask = WaveActiveBallot(true).x;
+
+    int2 lowerRightIntCoords = upperLeftIntCoords + int2(1, 1);
+    _ClampIntCoords(width, height, upperLeftIntCoords, lowerRightIntCoords);
+
+    int2 waveUpperLeftIntCoords = WaveActiveMin(upperLeftIntCoords);
+    int2 waveLowerRightIntCoords = WaveActiveMax(lowerRightIntCoords);
+    int2 bbSize = waveLowerRightIntCoords - waveUpperLeftIntCoords + 1;
+
+//#if PRINT_NUM_TEXELS_REQUIRED
+//    float numTexelsRequired = 1.1; // Random value over 1.0.
+//#else
+    float numTexelsRequired = 1.0;
+//#endif
+
+    bool fallbackNeeded = bbSize.x > 16 || bbSize.y > 16;
+
+    // Now, we want to put the 2x2 ones, i.e,. 11 into the variable mask.
+    //                                         11
+    // We shift the value 3 (0b11) in for the first row, and another 3 for the second row.
+    // However, if the coords have been clamped, we might need to shift just a 1 (clamped in x)
+    // and for clamping in y, we need only to shift one value into mask instead of 2.
+    uint64_t horizMask = (lowerRightIntCoords.x - upperLeftIntCoords.x == 1) ? 3 : 1;
+    uint64_t4 mask = uint64_t4(0, 0, 0, 0);
+    uint2 deltaCoords = upperLeftIntCoords - waveUpperLeftIntCoords;
+    uint bitNo = (deltaCoords.y << 4) + deltaCoords.x;
+    mask[bitNo >> 6] |= horizMask << (bitNo & 63);
+    if (lowerRightIntCoords.y - upperLeftIntCoords.y == 1)
+    {
+        uint bitNoY1 = bitNo + 16; // deltaCoords.y++
+        mask[bitNoY1 >> 6] |= horizMask << (bitNoY1 & 63);
+    }
+
+    uint64_t4 waveMask;
+    waveMask.x = WaveActiveBitOr(mask.x); // TODO: check if our NVAPI version handles uint64_t4.
+    waveMask.y = WaveActiveBitOr(mask.y);
+    waveMask.z = WaveActiveBitOr(mask.z);
+    waveMask.w = WaveActiveBitOr(mask.w);
+
+    uint16_t4 counts = uint16_t4((uint16_t)_countbits(waveMask.x), (uint16_t)_countbits(waveMask.y), (uint16_t)_countbits(waveMask.z), (uint16_t)_countbits(waveMask.w));
+
+    //print("counts =", counts);
+    //print("curLane =", WaveGetLaneIndex());
+    //print("waveMask0=", uint(waveMask.x & 0xFFFFFFFF));
+    //print("waveMask1=", uint(waveMask.x >> 32) & 0xFFFFFFFF);
+    //print("waveMask2=", uint(waveMask.y & 0xFFFFFFFF));
+    //print("waveMask3=", uint(waveMask.y >> 32) & 0xFFFFFFFF);
+
+   // bool visualizeModes = false;
+
+    uint curLaneIdx = WaveGetLaneIndex();
+    uint16_t2 sumCounts = uint16_t2(counts.x + counts.y, counts.z + counts.w);
+    uint16_t activeTexelsNeeded = sumCounts.x + sumCounts.y;
+   // if (visualizeModes && !fallbackNeeded)
+   // {
+   //     return mapToViridisColorMap(activeTexelsNeeded);
+   // }
+
+//#if PRINT_NUM_TEXELS_REQUIRED
+//    numTexelsRequired = activeTexelsNeeded / 32.0;
+//#endif
+
+    if (fallbackNeeded || activeTexelsNeeded > countbits(activeLanesBitMask))
+    {
+        if (debugFallback)
+            return float4(1,1,1,1);
+
+       return _EvaluateFallbackMethod(fallbackMethod, tex, width, height, uv, rnd01, upperLeftIntCoords, stCoords, floatTexCoords);
+    }
+
+    int kINT32_MIN = -2147483648;
+    float4 curPixelTexelValue = STF_FLT_MAX.xxxx;
+    int2 sampledTexelIntCoords = kINT32_MIN.xx; // Invalid coords.
+    float4 filteredColor = 0.0f.xxxx;
+    float4 bilinWeights = _bilinearWeights(stCoords);
+
+    // The following line is there to handle clamping corectly.
+    // In non-clamped cases, lowerRightIntCoords - upperLeftIntCoords = (1,1), but for clamping, we may get (0,1), for example.
+    int2 lowerRightOffset = (lowerRightIntCoords - upperLeftIntCoords) * int2(1, 16); //+16 is next line in the 16x16 mask.
+
+    if (_LanesLowerThanCountActive(activeTexelsNeeded))    // Handle the simple case.
+    {
+        if (curLaneIdx <= activeTexelsNeeded) // This lane needs to do a texture lookup.
+        {
+            uint2 deltaTexCoords = getDeltaTexCoords(curLaneIdx, waveMask, counts, sumCounts);
+            sampledTexelIntCoords = waveUpperLeftIntCoords + deltaTexCoords;
+            curPixelTexelValue = tex[sampledTexelIntCoords];
+        }
+
+        uint laneIdx0 = getLaneIdxFromBitMaskNo(bitNo, waveMask, counts, sumCounts);
+        filteredColor += bilinWeights.x * WaveReadLaneAt(curPixelTexelValue, laneIdx0);
+        filteredColor += bilinWeights.y * WaveReadLaneAt(curPixelTexelValue, laneIdx0 + lowerRightOffset.x);
+        uint laneIdx1 = getLaneIdxFromBitMaskNo(bitNo + lowerRightOffset.y, waveMask, counts, sumCounts);
+        filteredColor += bilinWeights.z * WaveReadLaneAt(curPixelTexelValue, laneIdx1);
+        filteredColor += bilinWeights.w * WaveReadLaneAt(curPixelTexelValue, laneIdx1 + lowerRightOffset.x);
+    }
+    else
+    {
+        uint lastLaneNeededIdx = __fns3(activeLanesBitMask, activeTexelsNeeded - 1);
+        if (curLaneIdx <= lastLaneNeededIdx) // This lane needs to do a texture lookup.
+        {
+            uint remappedLaneIdx = transformLaneNoToActiveLaneNo(curLaneIdx, activeLanesBitMask);
+            uint2 deltaTexCoords = getDeltaTexCoords(remappedLaneIdx, waveMask, counts, sumCounts);
+            sampledTexelIntCoords = waveUpperLeftIntCoords + deltaTexCoords;
+            curPixelTexelValue = tex[sampledTexelIntCoords];
+        }
+
+        // TODO: perhaps we should name these functions better:
+        //  * transformLaneNoToActiveLaneNo
+        //  * __fns3(activeLanesBitMask, laneIdx0)
+        // because they are the bijective function pair.
+        // Also, optimizations:
+        // * can we do both getLaneIdxFromBitMaskNo() in one call and get some perf?
+        // * The four calls to __fns3() can be merged into one call to a more complex function, but should get faster.
+        uint laneIdx0 = getLaneIdxFromBitMaskNo(bitNo, waveMask, counts, sumCounts);
+        uint laneIdx1 = getLaneIdxFromBitMaskNo(bitNo + lowerRightOffset.y, waveMask, counts, sumCounts);
+        uint4 remappedLaneIndices = uint4(__fns3(activeLanesBitMask, laneIdx0),
+                                          __fns3(activeLanesBitMask, laneIdx0 + lowerRightOffset.x),
+                                          __fns3(activeLanesBitMask, laneIdx1),
+                                          __fns3(activeLanesBitMask, laneIdx1 + lowerRightOffset.x));
+        filteredColor += bilinWeights.x * WaveReadLaneAt(curPixelTexelValue, remappedLaneIndices.x);
+        filteredColor += bilinWeights.y * WaveReadLaneAt(curPixelTexelValue, remappedLaneIndices.y);
+        filteredColor += bilinWeights.z * WaveReadLaneAt(curPixelTexelValue, remappedLaneIndices.z);
+        filteredColor += bilinWeights.w * WaveReadLaneAt(curPixelTexelValue, remappedLaneIndices.w);
+    }
+
+    filteredColor.w = activeTexelsNeeded / 32.0;
+    return filteredColor;
+#else
+    return 0.f;
+#endif
+}
+
+int _GetNthBit(uint mask, uint N)
+{
+    for (int i = 0; i < N; i++) {
+        mask &= ~(1u << firstbitlow(mask));
+    }
+    return firstbitlow(mask);
+}
+
+int PackInt2(int2 val)
+{
+    return (val.x << 16) | (0x0000FFFF & val.y);
+}
+
+int2 UnpackInt2(int val)
+{
+    int2 ret;
+    ret.x = val >> 16;
+    ret.y = 0x0000FFFF & val;
+    return ret;
+}
+
 STF_MUTATING
 float4 _Texture2DLoadImpl(
                             uint mipValueType,
@@ -900,6 +1784,43 @@ float4 _Texture2DLoadImpl(
     uint height;
     uint numberOfLevels;
     tex.GetDimensions(0, width, height, numberOfLevels);
+
+    if (STF_MAGNIFICATION_METHOD_MIN_MAX == _GetMagMethod())
+    {
+        bool isBorder = false;
+        float2 uvAddr = STF_ApplyAddressingMode2D(uv, uint2(1, 1), m_addressingModes.xy, isBorder);
+        return _Tex2DWaveMinMaxImpl(tex, uvAddr, width, height, m_u.xy, _GetFallbackMethod(), false  /*helper aware*/, _GetDebugFallback());
+    } 
+    else if (STF_MAGNIFICATION_METHOD_MIN_MAX_HELPER == _GetMagMethod())
+    {
+        bool isBorder = false;
+        float2 uvAddr = STF_ApplyAddressingMode2D(uv, uint2(1, 1), m_addressingModes.xy, isBorder);
+        return _Tex2DWaveMinMaxImpl(tex, uvAddr, width, height, m_u.xy, _GetFallbackMethod(), true /*helper aware*/, _GetDebugFallback());
+    } 
+    else if (STF_MAGNIFICATION_METHOD_MIN_MAX_V2 == _GetMagMethod())
+    {
+        bool isBorder = false;
+        float2 uvAddr = STF_ApplyAddressingMode2D(uv, uint2(1, 1), m_addressingModes.xy, isBorder);
+        return _Tex2DWaveMinMaxV2Impl(tex, uvAddr, width, height, m_u.xy, _GetFallbackMethod(), false  /*helper aware*/, _GetDebugFallback());
+    } 
+    else if (STF_MAGNIFICATION_METHOD_MIN_MAX_V2_HELPER == _GetMagMethod())
+    {
+        bool isBorder = false;
+        float2 uvAddr = STF_ApplyAddressingMode2D(uv, uint2(1, 1), m_addressingModes.xy, isBorder);
+        return _Tex2DWaveMinMaxV2Impl(tex, uvAddr, width, height, m_u.xy, _GetFallbackMethod(), true /*helper aware*/, _GetDebugFallback());
+    } 
+    else if (STF_MAGNIFICATION_METHOD_MASK == _GetMagMethod())
+    {
+        bool isBorder = false;
+        float2 uvAddr = STF_ApplyAddressingMode2D(uv, uint2(1, 1), m_addressingModes.xy, isBorder);
+        return _Tex2DWaveGlobalMaskImpl(tex, uvAddr, width, height, m_u.xy, _GetFallbackMethod(), false /*helper aware*/, _GetDebugFallback());
+    }
+    else if (STF_MAGNIFICATION_METHOD_MASK2 == _GetMagMethod())
+    {
+        bool isBorder = false;
+        float2 uvAddr = STF_ApplyAddressingMode2D(uv, uint2(1, 1), m_addressingModes.xy, isBorder);
+        return _Tex2DWaveGlobalMaskImpl(tex, uvAddr, width, height, m_u.xy, _GetFallbackMethod(), true /*helper aware*/, _GetDebugFallback());
+    }
 
     float3 samplePos = _GetTexture2DSamplePos(mipValueType, width, height, numberOfLevels, uv, ddxUV, ddyUV, mipValue);
     uint lod = uint(samplePos.z);
@@ -1347,9 +2268,11 @@ static STF_SamplerStateImpl _Create(float4 u)
     p.m_frameIndex       = 0;
     p.m_anisoMethod      = STF_ANISO_LOD_METHOD_DEFAULT;
     p.m_magMethod        = STF_MAGNIFICATION_METHOD_2x2_QUAD;
+    p.m_fallbackMethod   = STF_MAGNIFICATION_FALLBACK_METHOD_BL1STFILTER_FAST;
     p.m_addressingModes  = uint3(STF_ADDRESS_MODE_WRAP, STF_ADDRESS_MODE_WRAP, STF_ADDRESS_MODE_WRAP);
     p.m_sigma            = 0.7;
     p.m_u                = u;
+    p.m_debugFallback     = false;
     p.m_userData         = 0;
     return p;
 }
@@ -1358,10 +2281,12 @@ uint  m_filterType;      // STF_FILTER_TYPE_*
 uint  m_frameIndex;
 uint  m_anisoMethod;     // STF_ANISO_LOD_METHOD_*
 uint  m_magMethod;       // STF_MAGNIFICATION_METHOD_*
+uint  m_fallbackMethod;  // STF_MAGNIFICATION_FALLBACK_METHOD_*
 uint3 m_addressingModes; // STF_ADDRESS_MODE_*
 float m_sigma;           // used for Gaussian kernel
 float4 m_u;              // uniform random number(s)
 bool m_reseedOnSample;
+bool m_debugFallback;     // return debug color to visualize mag 3.0 failures.
 uint4 m_userData;        // User data, can be used to store some application specific auxilary data in the sampler object
 
 };
